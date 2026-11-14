@@ -1,0 +1,513 @@
+================================================================================
+Lenovo Legion 82WK / RTX 4060 Laptop - 140 W TGP Unlock on Linux
+================================================================================
+Date        : 2026-11-14
+Machine     : Lenovo Legion Y9000P IRX8 (82WK)
+CPU / GPU   : Intel Core i9-13900HX / NVIDIA RTX 4060 Laptop 8 GB
+BIOS / EC   : KWCN54WW / EC 1.51
+PSU         : 300 W
+OS          : Ubuntu 22.04, kernel 6.8.0-134-generic
+Driver      : NVIDIA 595.99.02 (proprietary), nvidia-powerd 2.0
+Tools       : LenovoLegionLinux (legion_laptop), acpi_call, acpica-tools
+Result      : 140 W GPU power budget unlocked
+              Peak measured power: 140.43 W
+              Sustained heavy load: 137-139 W
+              Idle: ~4 W, fans return to ~2100 RPM
+
+
+================================================================================
+1. TL;DR
+================================================================================
+
+The GPU was not limited by the NVIDIA driver, the VBIOS, or the ACPI _DSM
+warning. It was limited by ONE EC value:
+
+    gpu_power_target_offset  (NVPCF field TPPA, total CPU+GPU power on AC)
+
+It was set to 110 W. That is the TOTAL platform budget, so after the CPU took
+its share the GPU was left with only about 75 W. The LegionLinux sysfs attribute
+silently clamps this value to the firmware "capability" maximum of 110 W, so
+writing 150/200/255 to sysfs always read back 110.
+
+Fix: bypass the sysfs clamp with a raw ACPI WMAE call and set the field to its
+maximum, 255 W:
+
+    echo '\_SB.GZFD.WMAE 0 0x12 {0x00,0x00,0x04,0x02,0xFF,0x00,0x00,0x00}' \
+        > /proc/acpi/call
+
+After that NVPCF reports TPPA=255 W. The GPU budget becomes:
+
+    cTGP 115 W + PPAB 25 W = 140 W
+
+No ACPI SSDT override, no DSDT patching, no modified NVIDIA module is needed.
+
+
+================================================================================
+2. Initial symptoms
+================================================================================
+
+The laptop is specified as a 140 W RTX 4060 (115 W base + 25 W Dynamic Boost).
+On Linux, with LenovoLegionLinux and the EC set to Custom mode:
+
+    powermode                 = 255
+    gpu_ctgp_powerlimit       = 115
+    gpu_ppab_powerlimit       = 25
+
+nvidia-smi showed:
+
+    Current Power Limit : 115 W idle / 140 W under load
+    Default Power Limit : 55 W
+    Max Power Limit     : 140 W
+
+But the actual power draw never exceeded about 70-75 W in normal GPU
+workloads. SGEMM peaked at ~87 W, Blender OptiX ~65 W, glmark2 ~75 W.
+Clocks stayed around 2580-2595 MHz and temperatures were only 52-65 C.
+
+The "SW Power Cap" counter incremented, but the throttle reason often showed
+"Not Active", which made the problem look like a driver or VBIOS bug.
+
+
+================================================================================
+3. What did NOT work, and why (the pitfalls)
+================================================================================
+
+3.1 Treating nvidia-smi "Current Power Limit" as the real budget
+-----------------------------------------------------------------
+"Current Power Limit" is a dynamic ceiling. Dynamic Boost lowers it to the base
+cTGP (115 W) when idle and raises it to 140 W under load. Seeing 115 W at idle
+does not mean the unlock failed. The real test is actual power draw under a
+heavy load.
+
+3.2 Using ResNet-50 as the stress test
+--------------------------------------
+ResNet-50 batch 128 on this GPU draws only about 70-75 W even with a 140 W
+ceiling. It is not power-heavy enough. It made a working 140 W configuration
+look like a 75 W failure.
+
+Use a compute-heavy FP32 matmul + convolution loop instead, for example:
+
+    a = torch.randn(8192, 8192, device="cuda")
+    b = torch.randn(8192, 8192, device="cuda")
+    while time_left:
+        c = a @ b
+        y = conv2d(x, w, padding=1)
+
+That reaches 137-140 W immediately.
+
+3.3 "Fixing" the ACPI _DSM Argument #4 warning
+----------------------------------------------
+The kernel log showed:
+
+    ACPI Warning: \_SB.NPCF._DSM: Argument #4 type mismatch
+                  Found [Buffer], ACPI requires [Package]
+
+This is a warning, not the root cause. The firmware AML does:
+
+    CreateField (Arg3, 0x28, 0x02, NIGS)
+    CreateByteField (Arg3, 0x15, IORC)
+    CreateField (Arg3, 0xB0, One, PWCS)
+
+CreateField works on a Buffer. If you follow the ACPI spec and wrap Arg3 in a
+Package, the AML aborts with AE_AML_OPERAND_TYPE and nvidia-powerd fails:
+
+    ERROR! Error in getting the NvPCF Dynamic configuration
+    ERROR! Client (presumably SBIOS) has requested to disable Dynamic Boost
+
+Worse, the GPU is then clamped to the VBIOS default 55 W.
+
+Three variants were tried in nv-acpi.c:
+  - empty Package
+  - Package of Integers
+  - Package containing a Buffer
+All produced AE_AML_OPERAND_TYPE. Lesson: on this firmware, keep the original
+Buffer argument. The warning is cosmetic. Do not patch the driver to silence it.
+
+3.4 Assuming NPCS / GPSS gating is the problem
+----------------------------------------------
+The NPCF _DSM method is gated by:
+
+    If (\_SB.PC00.PEG1.PEGP.NPCS != Zero) { Return (NPCF(...)) }
+
+NPCS and GPSS live in an ACPI NVS OperationRegion. Reading them directly with
+acpi_call showed both were already 1, so the gate was not the issue. This is
+worth checking on other machines, but it was a dead end here.
+
+3.5 Going straight to the Punch-Pain / loq-npcf SSDT override
+-------------------------------------------------------------
+That project is for a Lenovo LOQ whose NPCF SSDT returns zeroed budgets. It
+builds an ordered CPIO with a patched DSDT and 22 CB-01 SSDTs because Linux
+matches ACPI table upgrades positionally when many tables share the same
+(Signature, OEM ID, OEM Table ID) tuple. On this 82WK, the NPCF table is
+ssdt12 and the budgets were NOT zero, so the whole SSDT/DSDT override route was
+unnecessary and much riskier than needed.
+
+Rule: first evaluate the existing NVPCF _DSM and read the returned TGPA/TPPA/
+MAGA values. Only override tables if those values are actually wrong or zero.
+
+3.6 Writing gpu_power_target_offset through sysfs
+--------------------------------------------------
+The LegionLinux attribute is clamped to the firmware capability data:
+
+    echo 150 > .../gpu_power_target_offset  -> readback 110
+    echo 200 > .../gpu_power_target_offset  -> readback 110
+    echo 255 > .../gpu_power_target_offset  -> readback 110
+
+The clamp happens in the kernel module, not in the EC. The EC accepts larger
+values. Bypass the module with the raw WMAE ACPI method.
+
+3.7 Forgetting that GGAP is an 8-bit field
+------------------------------------------
+GGAP / gpu_power_target_offset is a single byte. Values above 255 wrap:
+
+    260 -> 4 W
+    300 -> 44 W
+
+The maximum usable value is 255 W (2040 in 1/8 W units).
+
+3.8 Expecting 140 W to stay displayed at idle
+----------------------------------------------
+After the load stops, nvidia-powerd lowers the dynamic ceiling from 140 W back
+to the base cTGP, 115 W. Actual draw falls to 3-4 W. This is normal Dynamic
+Boost behavior and matches Windows. The "Max Power Limit" remains 140 W and the
+ceiling returns to 140 W as soon as a heavy load appears.
+
+3.9 Confusing thermal throttling with a power lock
+--------------------------------------------------
+With the stock fan curve, the GPU holds 137-139 W for about 20 seconds, reaches
+84-87 C, the fans settle around 3700 RPM, and the GPU then thermally throttles
+to about 120-130 W. That is the chassis cooling limit, not a 75 W power cap.
+With fan_fullspeed=1 (about 6000/6100 RPM on this unit), it holds 137-139 W for
+the whole 40-second test at 76-83 C.
+
+3.10 Small acpi_call gotchas
+----------------------------
+- /dev/mem is blocked by CONFIG_STRICT_DEVMEM; use acpi_call instead.
+- /proc/acpi/call accepts only a limited command length (about 256 bytes). A
+  long _DSM input buffer fails with "No space left on device". Read EC fields
+  or use a GET method instead.
+- A short _DSM Arg3 can fail with AE_AML_BUFFER_LIMIT because the AML creates
+  fields at offset 0xB0. This is a diagnostic artifact, not a driver bug.
+- Loading acpi_call is required: modprobe acpi_call.
+
+3.11 Leaving fans at full speed
+-------------------------------
+fan_fullspeed=1 sets both fans to about 6000 RPM and it persists. Always write 0
+after the test. On this machine fan_fullspeed=0 returns control to the EC curve
+and the fans drop back to ~2100 RPM at idle.
+
+3.12 Running a 45-second 140 W stress test on every boot
+--------------------------------------------------------
+A post-boot verification service is useful once, but leaving it enabled makes
+every boot hot and noisy. Disable it after collecting the evidence.
+
+
+================================================================================
+4. How the EC and NVPCF actually fit together
+================================================================================
+
+4.1 EC fields (82WK, KWCN54WW)
+------------------------------
+Read with acpi_call:
+
+    \_SB.PC00.LPCB.EC0.GPL1   = 0x19 = 25   (PPAB / Dynamic Boost offset)
+    \_SB.PC00.LPCB.EC0.GPL2   = 0x73 = 115  (configured TGP, cTGP)
+    \_SB.PC00.LPCB.EC0.GVBT   = 0x37 = 55   (base VBIOS TGP)
+    \_SB.PC00.LPCB.EC0.GGAP   = 0x6E = 110  (TPP target on AC, total CPU+GPU)
+
+4.2 What the NPCF _DSM returns
+------------------------------
+The NVPCF _DSM UUID is:
+
+    36b49710-2483-11e7-9598-0800200c9a66
+
+Function 0x02 returns a 49-byte dynamic-params buffer (PBD2). Important fields:
+
+    offset 0x05  TGPA  signed offset from static TGP, 1/8 W units
+    offset 0x19  TPPA  target total processor power on AC, 1/8 W units
+    offset 0x1D  MAGA  max GPU offset on AC, 1/8 W units
+
+With the original EC values the buffer contained:
+
+    TGPA = 0x01E0 = 480 / 8 = 60 W   (offset: 55 + 60 = 115 W cTGP)
+    TPPA = 0x0370 = 880 / 8 = 110 W  (total CPU+GPU budget)
+    MAGA = 0x00C8 = 200 / 8 = 25 W   (PPAB)
+
+The GPU can use at most:
+
+    base TGP 55 W + TGPA 60 W + MAGA 25 W = 140 W
+
+but only if TPPA leaves enough room after the CPU's share. With TPPA=110 W and
+the CPU using ~35 W, the GPU gets ~75 W. That is exactly what was observed.
+
+4.3 The fix
+------------
+Set GGAP / TPPA to 255 W:
+
+    \_SB.GZFD.WMAE 0 0x12 {0x00,0x00,0x04,0x02,0xFF,0x00,0x00,0x00}
+
+The buffer is two little-endian DWORDs:
+
+    first  DWORD = feature ID 0x02040000
+                   (GPU power target on AC offset from baseline)
+    second DWORD = value 0x000000FF = 255
+
+WMAE then writes EC GGAP and sends Notify(NPCF, 0xC0), so the NVIDIA driver
+re-reads NVPCF. Restart nvidia-powerd to make it re-negotiate immediately.
+
+Verified result: _DSM func2 now reports TPPA = 255 W.
+
+
+================================================================================
+5. Working setup, step by step
+================================================================================
+
+5.1 Requirements
+----------------
+- LenovoLegionLinux module (legion_laptop)
+- acpi_call kernel module (DKMS is fine)
+- NVIDIA proprietary driver with nvidia-powerd
+- EC in Custom mode (powermode=255)
+
+5.2 Set the EC values
+---------------------
+    EC=/sys/module/legion_laptop/drivers/platform:legion/PNP0C09:00
+    echo 255 > $EC/powermode
+    echo 115 > $EC/gpu_ctgp_powerlimit
+    echo 25  > $EC/gpu_ppab_powerlimit
+    echo 110 > $EC/gpu_power_target_offset   # keep module state consistent
+    echo 110 > $EC/cpu_cross_loading_powerlimit
+    echo 135 > $EC/cpu_longterm_powerlimit
+    echo 190 > $EC/cpu_shortterm_powerlimit
+
+5.3 Bypass the sysfs clamp
+--------------------------
+    modprobe acpi_call
+    printf '%s' '\_SB.GZFD.WMAE 0 0x12 {0x00,0x00,0x04,0x02,0xFF,0x00,0x00,0x00}' \
+        > /proc/acpi/call
+
+5.4 Restart the power daemon
+----------------------------
+    systemctl restart nvidia-powerd
+
+5.5 Verify
+----------
+    nvidia-smi -q -d POWER | sed -n '/GPU Power Readings/,/Power Samples/p'
+
+During a heavy load:
+
+    power.draw              ~137-140 W
+    enforced.power.limit    140 W
+    Max Power Limit         140 W
+
+At idle the dynamic ceiling drops back to 115 W; that is expected.
+
+
+================================================================================
+6. Boot persistence
+================================================================================
+
+5.1-style script used here (installed as /usr/local/bin/legion-140w and run by
+a systemd oneshot service after legiond and power-profiles-daemon):
+
+    #!/bin/sh
+    set -u
+    EC=/sys/devices/pci0000:00/0000:00:1f.0/PNP0C09:00
+
+    # never leave the fans latched at full speed
+    echo 0 > "$EC/fan_fullspeed" 2>/dev/null || true
+
+    echo 255 > "$EC/powermode"
+    sleep 1
+
+    if [ "$(cat /sys/class/power_supply/ADP0/online 2>/dev/null || echo 1)" = "1" ]; then
+        echo 115 > "$EC/gpu_ctgp_powerlimit"
+        echo 25  > "$EC/gpu_ppab_powerlimit"
+        echo 110 > "$EC/gpu_power_target_offset" 2>/dev/null || true
+
+        # bypass the sysfs clamp: TPPA = 255 W
+        modprobe acpi_call 2>/dev/null || true
+        if [ -w /proc/acpi/call ]; then
+            printf '%s' '\_SB.GZFD.WMAE 0 0x12 {0x00,0x00,0x04,0x02,0xFF,0x00,0x00,0x00}' \
+                > /proc/acpi/call
+        fi
+
+        echo 110 > "$EC/cpu_cross_loading_powerlimit"
+        echo 135 > "$EC/cpu_longterm_powerlimit"
+        echo 190 > "$EC/cpu_shortterm_powerlimit"
+    else
+        echo 55 > "$EC/gpu_ctgp_powerlimit"
+        echo 0  > "$EC/gpu_ppab_powerlimit"
+    fi
+
+    systemctl restart nvidia-powerd >/dev/null 2>&1 || true
+
+A oneshot systemd unit with:
+
+    [Unit]
+    Description=Lenovo Legion 140W power profile
+    After=legiond.service power-profiles-daemon.service
+    Wants=legiond.service
+
+    [Service]
+    Type=oneshot
+    ExecStart=/usr/local/bin/legion-140w
+    RemainAfterExit=yes
+
+    [Install]
+    WantedBy=multi-user.target
+
+is enough. Enable it with systemctl enable --now.
+
+Caveat: if the user later writes the sysfs attribute again, the module will
+clamp it back to 110 W. The boot script always performs the raw WMAE write after
+the sysfs write, so a reboot restores the full value.
+
+
+================================================================================
+7. Verified results
+================================================================================
+
+7.1 Heavy FP32 matmul 8192 + conv2d, stock fan curve
+----------------------------------------------------
+First 20 seconds:
+
+    137.18 W / 140.00 W / 2505 MHz / 78 C
+    139.23 W / 140.00 W / 2505 MHz / 80 C
+    139.50 W / 140.00 W / 2505 MHz / 80 C
+
+After ~30-60 seconds the GPU reaches 84-87 C, fans settle at 3700 RPM, and
+thermal throttling brings it to ~120-130 W. This is the cooling limit.
+
+7.2 Same load with fan_fullspeed=1
+----------------------------------
+    6000/6100 RPM, 40 seconds:
+
+    139.73 W / 140.00 W / 2475 MHz / 79 C
+    138.76 W / 140.00 W / 2460 MHz / 80 C
+    138.50 W / 140.00 W / 2490 MHz / 82 C
+
+All samples 137-139 W. After the test fan_fullspeed was reset to 0 and the
+fans returned to ~2100 RPM at idle.
+
+7.3 Idle
+--------
+    power.draw           3.3-4.5 W
+    enforced.power.limit 115 W (base cTGP)
+    temperature          47-53 C
+    fans                 2100-2300 RPM
+    fan_fullspeed        0
+
+
+================================================================================
+8. Diagnostic commands
+================================================================================
+
+8.1 Read EC fields
+------------------
+    modprobe acpi_call
+    printf '%s' '\_SB.PC00.LPCB.EC0.GPL1' > /proc/acpi/call; cat /proc/acpi/call
+    printf '%s' '\_SB.PC00.LPCB.EC0.GPL2' > /proc/acpi/call; cat /proc/acpi/call
+    printf '%s' '\_SB.PC00.LPCB.EC0.GVBT' > /proc/acpi/call; cat /proc/acpi/call
+    printf '%s' '\_SB.PC00.LPCB.EC0.GGAP' > /proc/acpi/call; cat /proc/acpi/call
+
+8.2 Read the NVPCF feature through WMAE
+---------------------------------------
+    printf '%s' '\_SB.GZFD.WMAE 0 0x11 0x02040000' > /proc/acpi/call
+    cat /proc/acpi/call
+
+Returns the TPPA value in watts (e.g. 0x6e = 110 before, 0xff = 255 after).
+
+8.3 Check the actual limit under load
+-------------------------------------
+    nvidia-smi --query-gpu=power.draw,enforced.power.limit,clocks.sm,temperature.gpu \
+        --format=csv -l 1
+
+8.4 Check throttle reasons
+--------------------------
+    nvidia-smi -q -d PERFORMANCE | sed -n '/Clocks Event Reasons/,/Sparse Operation/p'
+
+"SW Power Cap: Active" during a 140 W load means the budget is being enforced.
+"HW Thermal Slowdown" and temperatures near 87 C mean the chassis is the limit.
+
+
+================================================================================
+9. Rollback
+================================================================================
+
+    sudo systemctl disable --now legion-140w.service
+
+    sudo modprobe acpi_call
+    # restore TPPA = 110 W
+    printf '%s' '\_SB.GZFD.WMAE 0 0x12 {0x00,0x00,0x04,0x02,0x6E,0x00,0x00,0x00}' \
+        | sudo tee /proc/acpi/call
+
+    sudo systemctl restart nvidia-powerd
+
+Optionally set cTGP/PPAB back to the stock values through the LegionLinux sysfs
+attributes.
+
+
+================================================================================
+10. Key lessons / checklist for other laptops
+================================================================================
+
+1. Measure actual power under a HEAVY load before touching anything. ResNet is
+   not a power virus. Use large FP32 matmuls and convolutions.
+
+2. Read the NVPCF _DSM func2 response first. Decode TGPA (0x05), TPPA (0x19),
+   MAGA (0x1D). If they are zero, the SSDT override route may be needed. If they
+   are non-zero but too small, fix the EC/platform value instead.
+
+3. On Lenovo Legion, map the NVPCF values to EC fields:
+       GPL1 -> PPAB
+       GPL2 -> cTGP
+       GVBT -> static/base TGP
+       GGAP -> TPPA (total CPU+GPU budget)
+   The EC field names may differ on other models, but the ACPI DSDT usually
+   shows the mapping in the WMAE get/set handlers.
+
+4. The LegionLinux sysfs power-limit attributes are clamped to the firmware
+   capability data. If a write silently reads back a lower value, call the
+   underlying WMAE method directly through acpi_call.
+
+5. Do not "fix" the _DSM Buffer/Package warning unless you have read the AML.
+   Many Lenovo firmware implementations use CreateField on Arg3 and require a
+   Buffer, despite what the ACPI spec says.
+
+6. The 115 W at idle is Dynamic Boost lowering its ceiling. Test under load,
+   not at idle.
+
+7. Distinguish power limit from thermal limit: check clocks, temperature, fan
+   RPM and the throttle-reason block. 140 W for 20 seconds followed by
+   120-130 W at 87 C is thermal, not a power lock.
+
+8. Always reset fan_fullspeed to 0. If you need maximum sustained power for a
+   benchmark, enable it only for the run and turn it off immediately after.
+
+9. Keep a boot script idempotent and re-apply the raw value after every reboot.
+   EC settings do not necessarily survive a cold boot.
+
+10. Keep the change minimal. No DSDT/SSDT override, no driver patch, no VBIOS
+    mod was needed on this machine. One EC byte was the whole problem.
+
+
+================================================================================
+11. References
+================================================================================
+
+- LenovoLegionLinux (johnfanv2):
+  https://github.com/johnfanv2/LenovoLegionLinux
+- NVIDIA Dynamic Boost on Linux:
+  https://download.nvidia.com/XFree86/Linux-x86_64/580.82.09/README/dynamicboost.html
+- Punch-Pain/loq-npcf (SSDT override route, useful background):
+  https://github.com/Punch-Pain/loq-npcf
+- NVIDIA open-gpu-kernel-modules issue #1162 (NPCF binding):
+  https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1162
+- NVIDIA open-gpu-kernel-modules issue #1344 (SysPwrLimitGetInfo fallback):
+  https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1344
+- Coreboot NVPCF ASL reference:
+  https://review.coreboot.org/c/coreboot/+/64535
+
+================================================================================
+End of document.
+================================================================================
